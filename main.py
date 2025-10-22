@@ -1,21 +1,18 @@
 import os
-
-import openai
-import psycopg2
-import sounddevice as sd
-import numpy as np
-import tempfile
+import json
 import wave
+import tempfile
+import numpy as np
+import sounddevice as sd
+from vosk import Model, KaldiRecognizer
+from gtts import gTTS
 from openai import OpenAI
 from dotenv import load_dotenv
-import soundfile as sf
-from gtts import gTTS
-import re
+import psycopg2
 
 # ====== Parameters ======
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-
 
 DB_CONFIG = {
     "dbname": "shyraq_db",
@@ -25,13 +22,11 @@ DB_CONFIG = {
     "port": 5432
 }
 
-# ====== Connection ======
+# ====== Initializing ======
 client = OpenAI(api_key=OPENAI_API_KEY)
-
 conn = psycopg2.connect(**DB_CONFIG)
 cursor = conn.cursor()
 
-# Table to save conversations
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS dialog_history (
     id SERIAL PRIMARY KEY,
@@ -41,14 +36,20 @@ CREATE TABLE IF NOT EXISTS dialog_history (
 """)
 conn.commit()
 
-# ====== DB Functions ======
+# ====== Kazakh Speech Model (Vosk) ======
+MODEL_PATH = "vosk-model-small-kz-0.42"
+print("🔄 Vosk моделін жүктеу...")
+model = Model(MODEL_PATH)
+print("✅ Қазақ тілі моделі сәтті жүктелді!")
+
+# ====== DB functions ======
 def save_message(role, content):
     cursor.execute("INSERT INTO dialog_history (role, content) VALUES (%s, %s)", (role, content))
     conn.commit()
 
-# ====== Audio Functions =====
+# ====== Recording ======
 def record_voice(duration=5, fs=44100):
-    print("Recording...")
+    print("🎙️ Дыбыс жазылуда...")
     audio = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype=np.int16)
     sd.wait()
     filename = tempfile.mktemp(prefix="voice_", suffix=".wav")
@@ -59,51 +60,45 @@ def record_voice(duration=5, fs=44100):
         f.writeframes(audio.tobytes())
     return filename
 
-def transcribe_audio(filename):
-    with open(filename, "rb") as f:
-        transcription = client.audio.transcriptions.create(
-            model="gpt-4o-mini-transcribe",
-            file=f,
-        )
-    return transcription.text
+# ====== Transcribing (Vosk) ======
+def transcribe_audio_vosk(filename):
+    wf = wave.open(filename, "rb")
+    rec = KaldiRecognizer(model, wf.getframerate())
 
-def speak(text):
-    lang = detect_lang(text)
-    if lang == "ru":
-        # Russian speech with gTTS
-        tts = gTTS(text=text, lang="ru")
-        speech = tempfile.mktemp(suffix=".mp3")
-        tts.save(speech)
-        os.system(f"mpg123 {speech}")  # или sounddevice
-    else:
-        # The English speech
-        speech = tempfile.mktemp(suffix=".wav")
-        with client.audio.speech.with_streaming_response.create(
-            model="gpt-4o-mini-tts",
-            voice="alloy",
-            input=text
-        ) as response:
-            response.stream_to_file(speech)
-        os.system(f"mpg123 {speech}")
+    text_result = ""
+    while True:
+        data = wf.readframes(4000)
+        if len(data) == 0:
+            break
+        if rec.AcceptWaveform(data):
+            result = json.loads(rec.Result())
+            text_result += result.get("text", "") + " "
+    final = json.loads(rec.FinalResult())
+    text_result += final.get("text", "")
+    return text_result.strip()
+
+# ====== Voice the text ======
+def speak_kz(text):
+    print("🔊 Jarvis сөйлеп жатыр (OpenAI TTS)...")
+    speech = tempfile.mktemp(suffix=".wav")
+    with client.audio.speech.with_streaming_response.create(
+        model="gpt-4o-mini-tts",
+        voice="alloy",
+        input=text
+    ) as response:
+        response.stream_to_file(speech)
+
+    os.system(f"mpg123 {speech}")
 
 
-# ====== Detect Language =====
-
-def detect_lang(text):
-    if re.search(r'[а-яА-Я]', text):
-        return "ru"
-    else:
-        return "en"
-
-# ====== Chat ======
+# ====== Jarvis replying ======
 def chat_with_jarvis(prompt):
     save_message("user", prompt)
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {"role": "system",
-             "content": "You are AI Jarvis. Always respond in the same language as the user (English or Russian). Be clear and friendly."},
+            {"role": "system", "content": "Сен Jarvis есімді қазақ тілінде сөйлейтін жасанды интеллектісің. Пайдаланушыға тек қазақша жауап бер. Егер сұрақ ағылшынша болса, оны қазақша аударып түсіндір."},
             {"role": "user", "content": prompt}
         ]
     )
@@ -112,19 +107,23 @@ def chat_with_jarvis(prompt):
     save_message("assistant", answer)
     return answer
 
-# ====== Main loops ======
-print("🤖 Jarvis v0.1 started! Write something to get answer (or 'exit' to quit).")
+# ====== Main loop ======
+print("🤖 Jarvis v0.2 (Қазақша) іске қосылды!")
+print("Айтқыңыз келгенді айтыңыз (немесе 'шығу' деп аяқтаңыз).")
 
 while True:
-
     filename = record_voice(duration=5)
-    text = transcribe_audio(filename)
+    text = transcribe_audio_vosk(filename)
 
-    if text.lower() in ["exit", "quit"]:
-        print("Jarvis: Goodbye, sir 👋")
+    if not text:
+        print("❌ Сөз танылмады, қайтадан айтыңыз.")
+        continue
+
+    if text.lower() in ["шығу", "exit", "stop"]:
+        print("Jarvis: Көріскенше сау бол! 👋")
         break
 
-    print("You: ", text)
+    print("🧍‍♂️ Сіз:", text)
     reply = chat_with_jarvis(text)
-    print("Jarvis:", reply)
-    speak(reply)
+    print("🤖 Jarvis:", reply)
+    speak_kz(reply)

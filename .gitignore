@@ -3,3 +3,4 @@ venv/
 __pycache__/
 *.pyc
 *.env
+vosk-model-small-kz-0.42
