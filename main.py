@@ -5,9 +5,11 @@ import tempfile
 import numpy as np
 import sounddevice as sd
 from vosk import Model, KaldiRecognizer
+from scipy.signal import resample
 from gtts import gTTS
 from openai import OpenAI
 from dotenv import load_dotenv
+import time
 import psycopg2
 
 # ====== Parameters ======
@@ -47,18 +49,99 @@ def save_message(role, content):
     cursor.execute("INSERT INTO dialog_history (role, content) VALUES (%s, %s)", (role, content))
     conn.commit()
 
+# ====== Auto Select Microphone ======
+
+def auto_select_microphone():
+    devices = sd.query_devices()
+    for i, dev in enumerate(devices):
+        if dev['max_input_channels'] > 0:
+            sd.default.device = i
+            print(f"Микрофон таңдалды: {dev['name']}")
+            return
+    raise Exception("Микрофон табылмады!")
+
+# ===== Valid Sample Rate =====
+
+def get_valid_sample_rate():
+    device = sd.query_devices(sd.default.device, 'input')
+    rates = [16000, 32000, 44100, 48000]
+
+    for r in rates:
+        try:
+            sd.check_input_settings(samplerate=r, channels=1)
+            print(f"🎚 Микрофон {r} Hz жиілігін қолдайды")
+            return r
+        except:
+            continue
+
+    raise Exception("❌ Микрофон үшін қолайлы sample rate табылмады.")
+
+
+# ===== Main values =====
+
+auto_select_microphone()
+MIC_RATE = get_valid_sample_rate()
+
 # ====== Recording ======
-def record_voice(duration=5, fs=44100):
-    print("🎙️ Дыбыс жазылуда...")
-    audio = sd.rec(int(duration * fs), samplerate=fs, channels=1, dtype=np.int16)
-    sd.wait()
+
+def record_voice_auto(fs=MIC_RATE,
+                      silence_threshold=500,
+                      silence_limit=1.2,
+                      max_wait_before_speech=10):
+    print("🎙 Күту режимі: дауысты 10 секунд ішінде анықтау...")
+
+    recording = []
+    chunk_duration = 0.1
+    chunk_size = int(fs * chunk_duration)
+
+    silent_time = 0
+    active_speech_detected = False
+    start_wait = time.time()
+
+    while True:
+        chunk = sd.rec(chunk_size, samplerate=fs, channels=1, dtype=np.int16)
+        sd.wait()
+        amplitude = abs(chunk).mean()
+
+        if not active_speech_detected:
+            if amplitude > silence_threshold:
+                print("🎤 Дауыc анықталды!")
+                active_speech_detected = True
+                recording.append(chunk)
+            else:
+                if time.time() - start_wait >= max_wait_before_speech:
+                    print("⏳ 10 секунд ішінде дауыс болмады. Jarvis өшіріледі.")
+                    return None
+                continue
+        else:
+            recording.append(chunk)
+
+            if amplitude < silence_threshold:
+                silent_time += chunk_duration
+            else:
+                silent_time = 0
+
+            if silent_time >= silence_limit:
+                print("🔇 Тыныштық анықталды — жазу тоқтады.")
+                break
+
+    audio_data = np.concatenate(recording, axis=0)
+
+    # --- Resampling 16kHz ---
+    if fs != 16000:
+        target_length = int(len(audio_data) * 16000 / fs)
+        audio_data = resample(audio_data, target_length).astype(np.int16)
+        fs = 16000
+
     filename = tempfile.mktemp(prefix="voice_", suffix=".wav")
     with wave.open(filename, "wb") as f:
         f.setnchannels(1)
         f.setsampwidth(2)
         f.setframerate(fs)
-        f.writeframes(audio.tobytes())
+        f.writeframes(audio_data.tobytes())
+
     return filename
+
 
 # ====== Transcribing (Vosk) ======
 def transcribe_audio_vosk(filename):
@@ -112,18 +195,23 @@ print("🤖 Jarvis v0.2 (Қазақша) іске қосылды!")
 print("Айтқыңыз келгенді айтыңыз (немесе 'шығу' деп аяқтаңыз).")
 
 while True:
-    filename = record_voice(duration=5)
+    filename = record_voice_auto()
+
+    if filename is None:
+        break  # авто-выход
+
     text = transcribe_audio_vosk(filename)
 
     if not text:
-        print("❌ Сөз танылмады, қайтадан айтыңыз.")
+        print("Сөз танылмады, қайтадан айтыңыз.")
         continue
 
     if text.lower() in ["шығу", "exit", "stop"]:
         print("Jarvis: Көріскенше сау бол! 👋")
         break
 
-    print("🧍‍♂️ Сіз:", text)
+    print("Сіз:", text)
     reply = chat_with_jarvis(text)
     print("🤖 Jarvis:", reply)
     speak_kz(reply)
+
