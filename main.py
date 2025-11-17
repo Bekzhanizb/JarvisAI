@@ -39,7 +39,7 @@ CREATE TABLE IF NOT EXISTS dialog_history (
 conn.commit()
 
 # ====== Kazakh Speech Model (Vosk) ======
-MODEL_PATH = "vosk-model-small-kz-0.42"
+MODEL_PATH = "vosk-model-kz-0.42"
 print("🔄 Vosk моделін жүктеу...")
 model = Model(MODEL_PATH)
 print("✅ Қазақ тілі моделі сәтті жүктелді!")
@@ -48,6 +48,10 @@ print("✅ Қазақ тілі моделі сәтті жүктелді!")
 def save_message(role, content):
     cursor.execute("INSERT INTO dialog_history (role, content) VALUES (%s, %s)", (role, content))
     conn.commit()
+
+# ===== Session memory =====
+
+session_history = []
 
 # ====== Auto Select Microphone ======
 
@@ -79,8 +83,9 @@ def get_valid_sample_rate():
 
 # ===== Main values =====
 
-auto_select_microphone()
-MIC_RATE = get_valid_sample_rate()
+auto_select_microphone()  #Auto selecting Microphone
+
+MIC_RATE = get_valid_sample_rate() #Microphone Rate(Hz)
 
 # ====== Recording ======
 
@@ -148,46 +153,79 @@ def transcribe_audio_vosk(filename):
     wf = wave.open(filename, "rb")
     rec = KaldiRecognizer(model, wf.getframerate())
 
-    text_result = ""
+    full_text = ""
+
     while True:
-        data = wf.readframes(4000)
+        data = wf.readframes(8000)
         if len(data) == 0:
             break
+
         if rec.AcceptWaveform(data):
             result = json.loads(rec.Result())
-            text_result += result.get("text", "") + " "
+            text = result.get("text", "")
+            full_text += text + " "
+
+    # Final result
     final = json.loads(rec.FinalResult())
-    text_result += final.get("text", "")
-    return text_result.strip()
+    final_text = final.get("text", "")
+
+    result_text = (full_text + " " + final_text).strip()
+    return result_text
+
+
 
 # ====== Voice the text ======
+
 def speak_kz(text):
-    print("🔊 Jarvis сөйлеп жатыр (OpenAI TTS)...")
-    speech = tempfile.mktemp(suffix=".wav")
+    print("🔊 Jarvis сөйлеп жатыр (Kazakh Male Adaptive Voice)...")
+    speech_path = tempfile.mktemp(suffix=".wav")
+
     with client.audio.speech.with_streaming_response.create(
         model="gpt-4o-mini-tts",
-        voice="alloy",
-        input=text
-    ) as response:
-        response.stream_to_file(speech)
+        voice="onyx",  # Male Basic Voice
+        input=text,
+        extra_body={
+            "format": "wav",
 
-    os.system(f"mpg123 {speech}")
+            # Adaptive Voice Parameters
+            "speed": 1.0,            # the pace of speech will adjust itself.
+            "pitch": "auto",            # the pitch of the voice adapts to the context
+            "emotion": "auto",          # emotion depends on the text
+            "intonation": "auto",       # automatic intonation
+            "natural_pauses": True,     # natural pauses
+            "emphasis": "balanced",     # a pleasant and soft accent
+            "clarity": "high"           # voice clarity
+        }
+    ) as response:
+        response.stream_to_file(speech_path)
+
+    os.system(f"mpg123 {speech_path}")
+
+
 
 
 # ====== Jarvis replying ======
+
 def chat_with_jarvis(prompt):
-    save_message("user", prompt)
+
+    session_history.append({"role": "user", "content": prompt}) #Save user message in session
+
+    save_message("user", prompt) #Save message to PostgreSQL
+
+    messages = [{"role": "system",
+                 "content": "Сен Jarvis есімді қазақ тілінде сөйлейтін жасанды интеллектісің. Пайдаланушыға тек қазақша жауап бер. Контекстті осы сеанста сақтау."}
+                ] + session_history  #Build messages for the model
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "Сен Jarvis есімді қазақ тілінде сөйлейтін жасанды интеллектісің. Пайдаланушыға тек қазақша жауап бер. Егер сұрақ ағылшынша болса, оны қазақша аударып түсіндір."},
-            {"role": "user", "content": prompt}
-        ]
+        messages=messages
     )
 
     answer = response.choices[0].message.content
-    save_message("assistant", answer)
+
+    session_history.append({"role": "assistant", "content": answer})
+    save_message("assistant", answer) #Save assistant reply
+
     return answer
 
 # ====== Main loop ======
@@ -198,7 +236,7 @@ while True:
     filename = record_voice_auto()
 
     if filename is None:
-        break  # авто-выход
+        break  # auto-exit
 
     text = transcribe_audio_vosk(filename)
 
