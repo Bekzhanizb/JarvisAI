@@ -5,3 +5,5 @@ __pycache__/
 *.env
 vosk-model-small-kz-0.42
 vosk-model-kz-0.42
+intelligence/intelligence/app_index.json
+core/app_scanner/app_index.json
